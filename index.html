@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>State Flags RGB 3D Plotter</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; background: #f8f8f8; }
+    .container { max-width: 900px; margin: auto; background: #fff; padding: 2em; border-radius: 10px; box-shadow: 0 2px 8px #0001; }
+    h1 { text-align: center; }
+    .controls { display: flex; gap: 1em; flex-wrap: wrap; justify-content: center; margin-bottom: 1em; }
+    #selected-image { display: block; max-width: 300px; max-height: 200px; margin: 1em auto; border: 1px solid #ccc; border-radius: 6px; }
+    #plot { width: 100%; height: 600px; }
+    .actions { text-align: center; margin-top: 1em; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>State Flags RGB 3D Plotter</h1>
+    <div class="controls">
+      <label>
+        State Flag:
+        <select id="flag-select">
+          <option value="">-- Select a flag --</option>
+        </select>
+      </label>
+      <label>
+        Or upload image:
+        <input type="file" id="image-upload" accept="image/*">
+      </label>
+      <label>
+        K-Means Centroids:
+        <input type="number" id="k-input" min="1" max="10" value="3" style="width: 3em;">
+      </label>
+      <button id="auto-k-btn">Auto K</button>
+      <button id="reassign-btn">Reassign Centroids</button>
+      <button id="reset-btn">Reset</button>
+    </div>
+    <img id="selected-image" src="" alt="Selected Image" style="display:none;"/>
+    <div id="plot"></div>
+  </div>
+  <script>
+    // List of state flag image filenames (auto-generated)
+    const flagImages = [
+      "Alabama.png","Alaska.png","Arizona.png","Arkansas.png","California.png","Colorado.png","Connecticut.png","Delaware.png","Florida.png","Georgia.png","Hawaii.png","Idaho.png","Illinois.png","Indiana.png","Iowa.png","Kansas.png","Kentucky.png","Louisiana.png","Maine.png","Maryland.png","Massachusetts.png","Michigan.png","Minnesota.png","Mississippi.png","Missouri.png","Montana.png","Nebraska.png","Nevada.png","New_Hampshire.png","New_Jersey.png","New_Mexico.png","New_York.png","North_Carolina.png","North_Dakota.png","Ohio.png","Oklahoma.png","Oregon.png","Pennsylvania.png","Rhode_Island.png","South_Carolina.png","South_Dakota.png","Tennessee.png","Texas.png","Utah.png","Vermont.png","Virginia.png","Washington.png","West_Virginia.png","Wisconsin.png","Wyoming.png"
+    ];
+    const flagSelect = document.getElementById('flag-select');
+    flagImages.forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = `state_flags_png/${name}`;
+      opt.textContent = name.replace(/_/g, ' ').replace('.png', '');
+      flagSelect.appendChild(opt);
+    });
+
+    const imageUpload = document.getElementById('image-upload');
+    const selectedImage = document.getElementById('selected-image');
+    const plotDiv = document.getElementById('plot');
+    const kInput = document.getElementById('k-input');
+    const resetBtn = document.getElementById('reset-btn');
+    const autoKBtn = document.getElementById('auto-k-btn');
+    const reassignBtn = document.getElementById('reassign-btn');
+
+    let currentImageData = null;
+    let currentK = 3;
+    let currentCentroids = [];
+    let currentLabels = [];
+
+    function resetAll() {
+      flagSelect.value = "";
+      imageUpload.value = "";
+      selectedImage.style.display = 'none';
+      selectedImage.src = "";
+      plotDiv.innerHTML = "";
+      currentImageData = null;
+      currentCentroids = [];
+      currentLabels = [];
+      kInput.value = 3;
+    }
+
+    resetBtn.onclick = resetAll;
+
+    function handleImage(src) {
+      selectedImage.src = src;
+      selectedImage.style.display = 'block';
+      selectedImage.onload = () => {
+        processImage(selectedImage);
+      };
+    }
+
+    flagSelect.onchange = () => {
+      if (flagSelect.value) {
+        handleImage(flagSelect.value);
+        imageUpload.value = "";
+      }
+    };
+
+    imageUpload.onchange = (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          handleImage(ev.target.result);
+        };
+        reader.readAsDataURL(file);
+        flagSelect.value = "";
+      }
+    };
+
+    kInput.onchange = () => {
+      if (currentImageData) {
+        currentK = Math.max(1, Math.min(10, parseInt(kInput.value) || 3));
+        runKMeans(currentImageData, currentK);
+      }
+    };
+
+    autoKBtn.onclick = () => {
+      if (currentImageData) {
+        autoK(currentImageData);
+      }
+    };
+
+    reassignBtn.onclick = () => {
+      if (currentImageData && currentK) {
+        runKMeans(currentImageData, currentK, 100, true); // run until convergence
+      }
+    };
+
+    function processImage(img) {
+      // Draw image to canvas and get pixel data
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const maxDim = 128; // Downscale for performance
+      let w = img.naturalWidth, h = img.naturalHeight;
+      if (w > maxDim || h > maxDim) {
+        if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+        else { w = Math.round(w * maxDim / h); h = maxDim; }
+      }
+      canvas.width = w; canvas.height = h;
+      ctx.drawImage(img, 0, 0, w, h);
+      const data = ctx.getImageData(0, 0, w, h).data;
+      const pixels = [];
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+        if (a > 0) pixels.push([r, g, b]);
+      }
+      currentImageData = pixels;
+      autoK(pixels); // Automatically determine optimal K and plot
+    }
+
+    function plotRGB(pixels, centroids, labels) {
+      // Prepare data for Plotly
+      const xs = [], ys = [], zs = [], colors = [];
+      for (let i = 0; i < pixels.length; ++i) {
+        xs.push(pixels[i][0]);
+        ys.push(pixels[i][1]);
+        zs.push(pixels[i][2]);
+        if (labels && centroids) {
+          const c = centroids[labels[i]];
+          colors.push(`rgb(${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])})`);
+        } else {
+          colors.push(`rgb(${pixels[i][0]},${pixels[i][1]},${pixels[i][2]})`);
+        }
+      }
+      const tracePoints = {
+        x: xs, y: ys, z: zs,
+        mode: 'markers',
+        type: 'scatter3d',
+        marker: { size: 2, color: colors, opacity: 0.7 },
+        name: 'Pixels'
+      };
+      const centroidColors = centroids ? centroids.map(c => `rgb(${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])})`) : [];
+      const traceCentroids = centroids ? {
+        x: centroids.map(c=>c[0]),
+        y: centroids.map(c=>c[1]),
+        z: centroids.map(c=>c[2]),
+        mode: 'markers',
+        type: 'scatter3d',
+        marker: { size: 16, color: centroidColors, symbol: 'diamond', line: { width: 2, color: 'black' } },
+        name: 'Centroids'
+      } : null;
+      const data = traceCentroids ? [tracePoints, traceCentroids] : [tracePoints];
+      Plotly.newPlot(plotDiv, data, {
+        margin: {l:0, r:0, b:0, t:0},
+        scene: {
+          xaxis: {title: 'R', range: [0,255]},
+          yaxis: {title: 'G', range: [0,255]},
+          zaxis: {title: 'B', range: [0,255]},
+        },
+        showlegend: true,
+      }, {responsive: true});
+    }
+
+    // Simple k-means implementation (returns centroids, labels, and inertia)
+    function kmeans(data, k, maxIter=10, untilConverge=false) {
+      if (data.length === 0) return {centroids: [], labels: [], inertia: 0};
+      // Randomly initialize centroids
+      const centroids = [];
+      for (let i = 0; i < k; ++i) {
+        centroids.push([...data[Math.floor(Math.random()*data.length)]]);
+      }
+      let labels = new Array(data.length).fill(0);
+      let prevCentroids = [];
+      let inertia = 0;
+      for (let iter = 0; iter < maxIter; ++iter) {
+        // Assign labels
+        for (let i = 0; i < data.length; ++i) {
+          let minDist = 1e9, minIdx = 0;
+          for (let j = 0; j < k; ++j) {
+            const d = dist2(data[i], centroids[j]);
+            if (d < minDist) { minDist = d; minIdx = j; }
+          }
+          labels[i] = minIdx;
+        }
+        // Update centroids
+        const sums = Array.from({length: k}, () => [0,0,0,0]);
+        for (let i = 0; i < data.length; ++i) {
+          const l = labels[i];
+          sums[l][0] += data[i][0];
+          sums[l][1] += data[i][1];
+          sums[l][2] += data[i][2];
+          sums[l][3] += 1;
+        }
+        prevCentroids = centroids.map(c => [...c]);
+        for (let j = 0; j < k; ++j) {
+          if (sums[j][3] > 0) {
+            centroids[j][0] = sums[j][0]/sums[j][3];
+            centroids[j][1] = sums[j][1]/sums[j][3];
+            centroids[j][2] = sums[j][2]/sums[j][3];
+          }
+        }
+        // Check for convergence if requested
+        if (untilConverge) {
+          let changed = false;
+          for (let j = 0; j < k; ++j) {
+            if (dist2(centroids[j], prevCentroids[j]) > 1e-2) { changed = true; break; }
+          }
+          if (!changed) break;
+        }
+      }
+      // Compute inertia (sum of squared distances to closest centroid)
+      inertia = 0;
+      for (let i = 0; i < data.length; ++i) {
+        inertia += dist2(data[i], centroids[labels[i]]);
+      }
+      return {centroids, labels, inertia};
+    }
+    function dist2(a, b) {
+      return (a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2;
+    }
+
+    // Run k-means and update plot and state
+    function runKMeans(pixels, k, maxIter=10, untilConverge=false) {
+      const {centroids, labels} = kmeans(pixels, k, maxIter, untilConverge);
+      currentCentroids = centroids;
+      currentLabels = labels;
+      currentK = k;
+      kInput.value = k;
+      plotRGB(pixels, centroids, labels);
+    }
+
+    // Elbow method to find optimal K
+    function autoK(pixels) {
+      const minK = 1, maxK = 8;
+      let bestK = 1;
+      let prevInertia = null;
+      let bestScore = null;
+      let bestCentroids = null, bestLabels = null;
+      const inertias = [];
+      for (let k = minK; k <= maxK; ++k) {
+        const {centroids, labels, inertia} = kmeans(pixels, k, 10);
+        inertias.push(inertia);
+        if (k > 1) {
+          const relDrop = (inertias[k-2] - inertia) / inertias[k-2];
+          if (relDrop < 0.15 && bestK === k-1) break; // elbow: drop less than 15%
+        }
+        bestK = k;
+        bestCentroids = centroids;
+        bestLabels = labels;
+      }
+      currentK = bestK;
+      kInput.value = bestK;
+      currentCentroids = bestCentroids;
+      currentLabels = bestLabels;
+      plotRGB(pixels, bestCentroids, bestLabels);
+    }
+  </script>
+</body>
+</html>
